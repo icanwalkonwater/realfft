@@ -170,6 +170,8 @@ macro_rules! impl_r2c {
                         .as_str(),
                     )));
                 }
+                assert!(input.len() == self.length);
+                assert!(output.len() == (self.length / 2 + 1));
                 let fftlen = self.length / 2;
                 //for (val, buf) in input.chunks(2).take(fftlen).zip(self.buffer_in.iter_mut()) {
                 //    *buf = Complex::new(val[0], val[1]);
@@ -179,7 +181,7 @@ macro_rules! impl_r2c {
                     let len = input.len();
                     std::slice::from_raw_parts_mut(ptr, len / 2)
                 };
-
+                assert!(buf_in.len() == fftlen);
                 // FFT and store result in buffer_out
                 self.fft
                     .process(&mut buf_in, &mut self.buffer_out[0..fftlen]);
