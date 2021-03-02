@@ -130,6 +130,8 @@ pub use rustfft::FftNum;
 use rustfft::num_complex::Complex;
 use rustfft::num_traits::Zero;
 use rustfft::FftPlanner;
+#[cfg(feature = "avx")]
+use rustfft::FftPlannerAvx;
 use std::collections::HashMap;
 use std::error;
 use std::fmt;
@@ -343,10 +345,83 @@ impl<T: FftNum> Default for RealFftPlanner<T> {
     }
 }
 
+/// A planner is used to create FFTs. It caches results internally,
+/// so when making more than one FFT it is advisable to reuse the same planner.
+/// This planner supports the AVX instruction set.
+#[cfg(feature = "avx")]
+pub struct RealFftPlannerAvx<T: FftNum> {
+    planner: FftPlannerAvx<T>,
+    r2c_cache: HashMap<usize, Arc<dyn RealToComplex<T>>>,
+    c2r_cache: HashMap<usize, Arc<dyn ComplexToReal<T>>>,
+}
+
+#[cfg(feature = "avx")]
+impl<T: FftNum> RealFftPlannerAvx<T> {
+    /// Create a new planner.
+    pub fn new() -> Result<Self, ()> {
+        let planner = FftPlannerAvx::<T>::new()?;
+        Ok(Self {
+            r2c_cache: HashMap::new(),
+            c2r_cache: HashMap::new(),
+            planner,
+        })
+    }
+
+    /// Plan a Real-to-Complex forward FFT. Returns the FFT in a shared reference.
+    /// If requesting a second FFT of the same length, this will return a new reference to the already existing one.
+    pub fn plan_fft_forward(&mut self, len: usize) -> Arc<dyn RealToComplex<T>> {
+        if let Some(fft) = self.r2c_cache.get(&len) {
+            Arc::clone(&fft)
+        } else {
+            let fft = if len % 2 > 0 {
+                Arc::new(RealToComplexOdd::new_with_avx(len, &mut self.planner))
+                    as Arc<dyn RealToComplex<T>>
+            } else {
+                Arc::new(RealToComplexEven::new_with_avx(len, &mut self.planner))
+                    as Arc<dyn RealToComplex<T>>
+            };
+            self.r2c_cache.insert(len, Arc::clone(&fft));
+            fft
+        }
+    }
+
+    /// Plan a Complex-to-Real inverse FFT. Returns the FFT in a shared reference.
+    /// If requesting a second FFT of the same length, this will return a new reference to the already existing one.
+    pub fn plan_fft_inverse(&mut self, len: usize) -> Arc<dyn ComplexToReal<T>> {
+        if let Some(fft) = self.c2r_cache.get(&len) {
+            Arc::clone(&fft)
+        } else {
+            let fft = if len % 2 > 0 {
+                Arc::new(ComplexToRealOdd::new_with_avx(len, &mut self.planner))
+                    as Arc<dyn ComplexToReal<T>>
+            } else {
+                Arc::new(ComplexToRealEven::new_with_avx(len, &mut self.planner))
+                    as Arc<dyn ComplexToReal<T>>
+            };
+            self.c2r_cache.insert(len, Arc::clone(&fft));
+            fft
+        }
+    }
+}
+
 impl<T: FftNum> RealToComplexOdd<T> {
     /// Create a new RealToComplex FFT for input data of a given length, and uses the given FftPlanner to build the inner FFT.
     /// Panics if the length is not odd.
     pub fn new(length: usize, fft_planner: &mut FftPlanner<T>) -> Self {
+        if length % 2 == 0 {
+            panic!("Length must be odd, got {}", length,);
+        }
+        let fft = fft_planner.plan_fft_forward(length);
+        let scratch_len = fft.get_inplace_scratch_len() + length;
+        RealToComplexOdd {
+            length,
+            fft,
+            scratch_len,
+        }
+    }
+
+    #[cfg(feature = "avx")]
+    pub fn new_with_avx(length: usize, fft_planner: &mut FftPlannerAvx<T>) -> Self {
         if length % 2 == 0 {
             panic!("Length must be odd, got {}", length,);
         }
@@ -446,6 +521,30 @@ impl<T: FftNum> RealToComplexEven<T> {
     /// Create a new RealToComplex FFT for input data of a given length, and uses the given FftPlanner to build the inner FFT.
     /// Panics if the length is not even.
     pub fn new(length: usize, fft_planner: &mut FftPlanner<T>) -> Self {
+        if length % 2 > 0 {
+            panic!("Length must be even, got {}", length,);
+        }
+        let twiddle_count = if length % 4 == 0 {
+            length / 4
+        } else {
+            length / 4 + 1
+        };
+        let twiddles: Vec<Complex<T>> = (1..twiddle_count)
+            .map(|i| compute_twiddle(i, length) * T::from_f64(0.5).unwrap())
+            .collect();
+        //let mut fft_planner = FftPlanner::<T>::new();
+        let fft = fft_planner.plan_fft_forward(length / 2);
+        let scratch_len = fft.get_outofplace_scratch_len();
+        RealToComplexEven {
+            twiddles,
+            length,
+            fft,
+            scratch_len,
+        }
+    }
+
+    #[cfg(feature = "avx")]
+    pub fn new_with_avx(length: usize, fft_planner: &mut FftPlannerAvx<T>) -> Self {
         if length % 2 > 0 {
             panic!("Length must be even, got {}", length,);
         }
@@ -635,6 +734,21 @@ impl<T: FftNum> ComplexToRealOdd<T> {
             scratch_len,
         }
     }
+
+    #[cfg(feature = "avx")]
+    pub fn new_with_avx(length: usize, fft_planner: &mut FftPlannerAvx<T>) -> Self {
+        if length % 2 == 0 {
+            panic!("Length must be odd, got {}", length,);
+        }
+        //let mut fft_planner = FftPlanner::<T>::new();
+        let fft = fft_planner.plan_fft_inverse(length);
+        let scratch_len = length + fft.get_inplace_scratch_len();
+        ComplexToRealOdd {
+            length,
+            fft,
+            scratch_len,
+        }
+    }
 }
 
 impl<T: FftNum> ComplexToReal<T> for ComplexToRealOdd<T> {
@@ -732,6 +846,30 @@ impl<T: FftNum> ComplexToRealEven<T> {
     /// Create a new ComplexToReal FFT for input data of a given length, and uses the given FftPlanner to build the inner FFT.
     /// Panics if the length is not even.
     pub fn new(length: usize, fft_planner: &mut FftPlanner<T>) -> Self {
+        if length % 2 > 0 {
+            panic!("Length must be even, got {}", length,);
+        }
+        let twiddle_count = if length % 4 == 0 {
+            length / 4
+        } else {
+            length / 4 + 1
+        };
+        let twiddles: Vec<Complex<T>> = (1..twiddle_count)
+            .map(|i| compute_twiddle(i, length).conj())
+            .collect();
+        //let mut fft_planner = FftPlanner::<T>::new();
+        let fft = fft_planner.plan_fft_inverse(length / 2);
+        let scratch_len = fft.get_outofplace_scratch_len();
+        ComplexToRealEven {
+            twiddles,
+            length,
+            fft,
+            scratch_len,
+        }
+    }
+
+    #[cfg(feature = "avx")]
+    pub fn new_with_avx(length: usize, fft_planner: &mut FftPlannerAvx<T>) -> Self {
         if length % 2 > 0 {
             panic!("Length must be even, got {}", length,);
         }
@@ -902,6 +1040,8 @@ impl<T: FftNum> ComplexToReal<T> for ComplexToRealEven<T> {
 #[cfg(test)]
 mod tests {
     use crate::RealFftPlanner;
+    #[cfg(feature = "avx")]
+    use crate::RealFftPlannerAvx;
     use rand::Rng;
     use rustfft::num_complex::Complex;
     use rustfft::num_traits::Zero;
@@ -985,6 +1125,88 @@ mod tests {
     fn real_to_complex() {
         for length in 1..1000 {
             let mut real_planner = RealFftPlanner::<f64>::new();
+            let r2c = real_planner.plan_fft_forward(length);
+            let mut out_a = r2c.make_output_vec();
+            let mut indata = r2c.make_input_vec();
+            let mut rng = rand::thread_rng();
+            for val in indata.iter_mut() {
+                *val = rng.gen::<f64>();
+            }
+            let mut rustfft_check = indata
+                .iter()
+                .map(|val| Complex::from(val))
+                .collect::<Vec<Complex<f64>>>();
+            let mut fft_planner = FftPlanner::<f64>::new();
+            let fft = fft_planner.plan_fft_forward(length);
+
+            fft.process(&mut rustfft_check);
+            r2c.process(&mut indata, &mut out_a).unwrap();
+            let maxdiff = compare_complex(&out_a, &rustfft_check[0..(length / 2 + 1)]);
+            assert!(
+                maxdiff < 1.0e-9,
+                "Length: {}, too large error: {}",
+                length,
+                maxdiff
+            );
+        }
+    }
+
+    // Compare ComplexToReal with standard iFFT but with AVX
+    #[test]
+    #[cfg(feature = "avx")]
+    fn complex_to_real_avx() {
+        for length in 1..1000 {
+            let mut real_planner = RealFftPlannerAvx::<f64>::new().unwrap();
+            let c2r = real_planner.plan_fft_inverse(length);
+            let mut out_a = c2r.make_output_vec();
+            let mut indata = c2r.make_input_vec();
+            let mut rustfft_check: Vec<Complex<f64>> = vec![Complex::zero(); length];
+            let mut rng = rand::thread_rng();
+            for val in indata.iter_mut() {
+                *val = Complex::new(rng.gen::<f64>(), rng.gen::<f64>());
+            }
+            indata[0].im = 0.0;
+            if length % 2 == 0 {
+                indata[length / 2].im = 0.0;
+            }
+            for (val_long, val) in rustfft_check
+                .iter_mut()
+                .take(length / 2 + 1)
+                .zip(indata.iter())
+            {
+                *val_long = *val;
+            }
+            for (val_long, val) in rustfft_check
+                .iter_mut()
+                .rev()
+                .take(length / 2)
+                .zip(indata.iter().skip(1))
+            {
+                *val_long = val.conj();
+            }
+            let mut fft_planner = FftPlanner::<f64>::new();
+            let fft = fft_planner.plan_fft_inverse(length);
+
+            c2r.process(&mut indata, &mut out_a).unwrap();
+            fft.process(&mut rustfft_check);
+
+            let check_real = rustfft_check.iter().map(|val| val.re).collect::<Vec<f64>>();
+            let maxdiff = compare_f64(&out_a, &check_real);
+            assert!(
+                maxdiff < 1.0e-9,
+                "Length: {}, too large error: {}",
+                length,
+                maxdiff
+            );
+        }
+    }
+
+    // Compare RealToComplex with standard FFT but with AVX
+    #[test]
+    #[cfg(feature = "avx")]
+    fn real_to_complex_avx() {
+        for length in 1..1000 {
+            let mut real_planner = RealFftPlannerAvx::<f64>::new().unwrap();
             let r2c = real_planner.plan_fft_forward(length);
             let mut out_a = r2c.make_output_vec();
             let mut indata = r2c.make_input_vec();

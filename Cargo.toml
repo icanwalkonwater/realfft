@@ -12,6 +12,10 @@ readme = "README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = ["avx"]
+avx = ["rustfft/avx"]
+
 [dependencies]
 rustfft = "5.0.1"
 
